@@ -10,25 +10,27 @@ across three dedicated node pools, plus a real Let's Encrypt wildcard certificat
 | `dev` | user workloads: dev environments, deployed namespaces, `okteto up` containers, the Okteto daemonset | yes | yes |
 | `build` | BuildKit | yes | yes |
 
-Keeping the cluster's default pool separate is what lets all three Okteto pools
-be tainted. Something has to stay schedulable for `kube-dns` and friends, so the
-alternative is leaving one Okteto pool untainted and sharing it with system
-workloads.
-
 Why bother: BuildKit is resource hungry and will happily starve the control
 plane, and user workloads are untrusted and unpredictable. Separating the three
 means a runaway build or a broken dev environment cannot take down the Okteto API.
 
-Validated on a real GKE cluster: chart 1.47.0, Kubernetes 1.35, cert-manager
-v1.21.1, including a real app deploy landing entirely on the dev pool and a
-trusted Let's Encrypt wildcard certificate.
+Keeping the cluster's default pool separate is what lets all three Okteto pools
+be tainted. Something has to stay schedulable for `kube-dns` and friends.
 
-That cluster ran with the `okteto` pool untainted and no separate default pool.
-The Helm values in this repo are byte-for-byte the ones it ran. Splitting out a
-default pool and tainting `okteto` changes only the node topology, and it makes
-the `globals.tolerations.okteto` entry load-bearing rather than a no-op. All 23
-chart workloads render with both a pool selector and its matching toleration, so
-each can schedule onto its tainted pool.
+## Tested with
+
+| component | version |
+|---|---|
+| Okteto Helm chart | 1.47.0 |
+| Kubernetes (GKE) | 1.35.6-gke.1258000 |
+| cert-manager | v1.21.1 |
+| Okteto CLI | 3.21.0 |
+
+Okteto supports Kubernetes 1.33 through 1.35. GKE's REGULAR channel also offers
+1.36, which is outside that range, so `01-create-cluster.sh` pins the version
+rather than taking the channel default. Check the supported range in the
+[Okteto docs](https://www.okteto.com/docs/get-started/install/google-gke/)
+before bumping it.
 
 ## Contents
 
@@ -37,14 +39,16 @@ each can schedule onto its tainted pool.
 | `config.yaml` | Okteto Helm values, three-pool scheduling |
 | `config-letsencrypt.yaml` | values overlay swapping the self-signed cert for Let's Encrypt |
 | `cert-manager.yaml` | ClusterIssuer + wildcard Certificate |
-| `scripts/01-create-cluster.sh` | GKE cluster and the three node pools |
+| `scripts/01-create-cluster.sh` | GKE cluster and the node pools |
 | `scripts/02-install-okteto.sh` | Okteto chart install and wildcard DNS records |
 | `scripts/03-setup-dns-iam.sh` | Workload Identity so cert-manager can solve DNS-01 |
+| `scripts/verify-placement.sh` | check every pod against the pool it actually landed on |
+| `scripts/99-teardown.sh` | delete the cluster, DNS records and service account |
 
 ## Prerequisites
 
-- `gcloud`, `kubectl` >= 1.28, `helm` >= 3.14
-- `gke-gcloud-auth-plugin` (see gotcha 7 below)
+- `gcloud`, `kubectl` >= 1.28, `helm` >= 3.14, and `gke-gcloud-auth-plugin`
+- The `okteto` CLI, for the verification step
 - An Okteto license
 - A domain in Cloud DNS you can add wildcard records to
 
@@ -76,9 +80,9 @@ The node labels and taints are the contract the Helm values depend on:
 | `build` | `okteto-node-pool=build` | `okteto-node-pool=build:NoSchedule` |
 
 > **Leave the default pool untainted.** Taint every pool in the cluster and
-> GKE's own system workloads (`kube-dns`, `metrics-server`) have nowhere to
-> schedule, breaking the cluster before Okteto is even installed. Anything
-> without an `okteto-node-pool` selector, including cert-manager, lands here.
+> GKE's own system workloads have nowhere to schedule, breaking the cluster
+> before Okteto is even installed. Anything without an `okteto-node-pool`
+> selector, including cert-manager, lands here.
 
 ### 2. Install Okteto
 
@@ -142,198 +146,96 @@ helm upgrade okteto okteto/okteto \
 
 ## Verifying placement
 
-Rendering the chart is not proof. Check what actually happened.
+Rendering the chart with `helm template` only tells you what the *selectors*
+say. It cannot tell you where a pod actually ended up. Check the cluster.
 
-**Every pod against its node's real pool.** This compares each pod's selector to
-the label on the node it actually landed on, which catches a pod that is pinned
-but scheduled somewhere else:
+### Control plane
 
-```bash
-kubectl get nodes -o json > /tmp/nodes.json
-kubectl get pods -A -o json > /tmp/pods.json
-python3 - <<'PY'
-import json
-nodes={n['metadata']['name']: n['metadata']['labels'].get('okteto-node-pool','(unlabeled)')
-       for n in json.load(open('/tmp/nodes.json'))['items']}
-for p in json.load(open('/tmp/pods.json'))['items']:
-    if p['metadata']['namespace'] != 'okteto': continue
-    if p['status']['phase'] not in ('Running','Pending'): continue
-    sel=(p['spec'].get('nodeSelector') or {}).get('okteto-node-pool','(none)')
-    actual=nodes.get(p['spec'].get('nodeName'),'(unscheduled)')
-    flag='OK' if sel==actual else 'MISMATCH'
-    print(f"{p['metadata']['name'][:50]:<52} {sel:<8} {actual:<8} {flag}")
-PY
-```
-
-**User workloads really land on the dev pool.** The Okteto mutating webhook only
-touches namespaces labeled `dev.okteto.com=true`, so reproduce that:
+List the Okteto pods with the node each one is on, then compare against the pool
+labels on those nodes:
 
 ```bash
-kubectl create namespace pooltest
-kubectl label namespace pooltest dev.okteto.com=true
-kubectl -n pooltest create deployment nginx --image=nginx:alpine
-kubectl -n pooltest get pod -o jsonpath='{.items[0].spec.nodeSelector}'
-# expect {"okteto-node-pool":"dev"} plus the matching toleration
-kubectl delete namespace pooltest
+kubectl get pods -n okteto -o wide
+kubectl get nodes -L okteto-node-pool
 ```
 
-**Prove the pinning is airtight with an empty spare pool.** Add a pool with zero
-nodes, labeled but **untainted**, and confirm it stays empty. A tainted empty
-pool proves nothing, since the taint alone would keep pods away; an untainted one
-is a real test, because anything not properly pinned is free to land there:
+Every pod in the `okteto` namespace should sit on an `okteto` node, except the
+two daemonsets (`okteto-daemon`, `okteto-prepullimages`) which belong on `dev`,
+and `okteto-buildkit` which belongs on `build`.
+
+To check a single pod's intended pool:
 
 ```bash
-gcloud container node-pools create spare \
-  --cluster "$CLUSTER" --zone "$ZONE" --project "$PROJECT" \
-  --machine-type n2-standard-4 --num-nodes 0 \
-  --enable-autoscaling --min-nodes 0 --max-nodes 2 \
-  --node-labels okteto-node-pool=spare
-
-kubectl get nodes -l okteto-node-pool=spare -o name | wc -l   # expect 0
+kubectl get pod -n okteto <pod> -o jsonpath='{.spec.nodeSelector}{"\n"}{.spec.tolerations}'
 ```
 
-Expected steady state on a default install:
-
-| pool | workloads |
-|---|---|
-| `dev` | `okteto-daemon`, `okteto-prepullimages`, plus every user pod |
-| `build` | `okteto-buildkit` |
-| `okteto` | everything else in the `okteto` namespace, including `okteto-registry` and all jobs/cronjobs |
-| `default` | GKE system workloads and cert-manager, none of which carry an `okteto-node-pool` selector |
-
-## Gotchas
-
-Each of these cost real debugging time.
-
-**1. `wildcardCertificate.create: false` is not enough on its own.**
-In the chart's `values.yaml`, ingress-nginx receives its default certificate as
-a hardcoded string literal:
-
-```yaml
-ingress-nginx:
-  controller:
-    extraArgs:
-      default-ssl-certificate: $(POD_NAMESPACE)/default-ssl-certificate-selfsigned
-```
-
-That literal does **not** derive from `wildcardCertificate.name`, unlike every
-other consumer of the certificate. Helm cannot template subchart values, so it
-cannot follow the rename on its own.
-
-Set `create: false` alone and two things happen. The chart stops rendering the
-`default-ssl-certificate-selfsigned` secret (it is gated on `create`), so nginx's
-*default* certificate now points at a secret that does not exist and falls back
-to nginx's built-in `Kubernetes Ingress Controller Fake Certificate`. Meanwhile
-the chart-rendered ingresses (`okteto.`, `registry.`, `buildkit.`, `kubernetes.`
-and the `*.SUBDOMAIN` wildcard) *do* get `secretName: default-ssl-certificate`
-in their TLS blocks, so those hosts still serve the correct certificate over SNI.
-
-So the breakage is narrow but genuinely confusing: cert-manager reports `Ready`,
-your main hosts look fine, and only requests that do not match an ingress TLS
-host hit the fake certificate. `config-letsencrypt.yaml` repoints the arg.
-Verify with:
+`scripts/verify-placement.sh` does this comparison for every pod and exits
+non-zero if anything is unpinned or landed on the wrong pool:
 
 ```bash
-helm template okteto okteto/okteto -f config.yaml -f config-letsencrypt.yaml \
-  | grep -c default-ssl-certificate-selfsigned   # must be 0
+./scripts/verify-placement.sh
 ```
 
-This *is* documented, but not where you would look for it. The
-[cert-manager page](https://www.okteto.com/docs/self-hosted/install/certificates/cert-manager/)
-is a stub that delegates to community forum guides, and those guides do carry the
-`extraArgs` override. The Helm configuration reference, which is the natural
-place to look, documents `wildcardCertificate.create` and `.name` with no mention
-of the nginx arg. The community guides also take a slightly different route: they
-name the secret `okteto-letsencrypt` and set both `wildcardCertificate.name` and
-the nginx arg to match. This repo instead keeps the chart's default secret name
-and overrides only the arg. Either works, as long as the two agree.
+### User workloads
 
-**2. The terse pool short form is deprecated, but only the chart tells you so.**
-`tolerations.{oktetoPool,buildPool,devPool}` sets the nodeSelector and
-auto-generates the matching toleration in three lines. Install with it and the
-chart prints:
+The important check is that a real application lands on the `dev` pool. Deploy
+one through Okteto rather than with `kubectl`, so it goes through the same path
+your users will take:
 
-```
-[WARNING] .Values.tolerations.[oktetoPool, devPool, buildPool] is deprecated
-and will be removed in Okteto Chart 2.0.
+```bash
+okteto context use https://okteto.$SUBDOMAIN
+okteto namespace create pooltest
+okteto pipeline deploy --repository https://github.com/okteto/movies --name movies --wait
 ```
 
-That warning is the only place you will find out. The Helm configuration
-reference has no entry for these values and never calls them deprecated, and
-two of its own runnable examples (the daemonset and defaultBackend sections)
-still teach the old form. The migration guide exists as a community post, but
-nothing in the docs links to it, only the install-time warning does. The
-BuildKit high-performance page is the clean exception: it already uses
-`buildkit.nodeSelectors` / `buildkit.tolerations`.
+Then confirm where it landed:
 
-This repo uses the replacement throughout. One behavioral difference worth
-knowing: the short form also places `okteto-registry` on the build pool
-(co-located with BuildKit for image push/pull locality), while the supported
-form leaves it on the okteto pool, since there is no registry-specific selector.
+```bash
+NAMESPACE=pooltest ./scripts/verify-placement.sh
+kubectl get pods -n pooltest -o wide
+```
 
-**3. Ignore the docs note claiming `globals.nodeSelectors.dev` needs `tolerations.devPool`.**
-The Helm reference states, in four separate places, that dev node selectors
-"will not be applied to user workloads unless a `tolerations.devPool` value is
-also set", calling it legacy behavior. Taken literally that is a trap: it tells
-you to keep using the very value the chart warns is being removed.
+Every pod should report `okteto-node-pool=dev` and be running on a `dev` node.
+On our test cluster all eight services of
+[okteto/movies](https://github.com/okteto/movies) (api, catalog, frontend, kafka,
+mongodb, postgresql, rent, worker) scheduled onto the dev pool.
 
-On chart 1.47.0 it is also **not true**. Verified on a live cluster with
-`tolerations.devPool` unset (`OKTETO_DEV_POOL: ""` in the configmap): every user
-pod in an Okteto-managed namespace still received `nodeSelector:
-okteto-node-pool=dev` plus the matching toleration, and landed on the dev pool.
-The dev selectors are applied unconditionally; only the auto-generated taint
-toleration was ever gated on `devPool`, which is why this config spells out
-`globals.tolerations.dev` explicitly.
+Clean up:
 
-One related error in that same reference: it says to "define a `devPool` entry
-in `globals.tolerations`". There is no such key. `globals.tolerations` takes
-`okteto` and `dev` only.
+```bash
+okteto namespace delete pooltest
+```
 
-**4. Subcharts ignore `globals` entirely.**
-`ingress-nginx`, `okteto-nginx` and `reloader` are upstream subcharts. Render the
-chart without pinning them and they come out with no `nodeSelector` at all. With
-all three Okteto pools tainted, they would then land on the small default pool
-alongside `kube-dns` instead of on the okteto pool, which is both wrong and a
-good way to exhaust that pool. Pin all three by hand.
+## Known limitation: the nginx and reloader subcharts
 
-**5. `regcredsManager` uses `replicas`, not `replicaCount`.**
-Set `replicaCount` everywhere else and this one silently stays at 2.
+`globals.nodeSelectors` and `globals.tolerations` pin the Okteto chart's own
+workloads, but they are **not** applied to three components that come from
+subcharts:
 
-**6. GKE offers Kubernetes versions Okteto does not support.**
-The REGULAR channel served 1.36 while Okteto supported 1.33 through 1.35. Pin
-`--cluster-version` explicitly instead of taking the channel default.
+- `okteto-ingress-nginx-controller`
+- `okteto-okteto-nginx-controller`
+- `okteto-reloader`
 
-**7. `gke-gcloud-auth-plugin` may not be on your PATH.**
-`kubectl` cannot authenticate to GKE without it. Install with
-`gcloud components install gke-gcloud-auth-plugin`. Some distributions (homebrew's
-`google-cloud-sdk` among them) then leave the binary in the SDK's own `bin`
-directory rather than symlinking it, so it is installed but still not found. The
-scripts resolve it from the SDK root.
+Render the chart with only `globals` set and those three come out with no
+`nodeSelector` and no `tolerations` at all. On a cluster where every Okteto pool
+is tainted, they cannot schedule onto any of them: they land on whatever
+untainted pool exists, or stay `Pending` if none does. Losing both ingress
+controllers takes the instance down.
 
-**8. The daemonset covers only dev pool nodes.**
-The Okteto daemonset follows the `dev` selectors, so with a dedicated dev pool it
-runs *only* there. Your okteto and build nodes get no daemonset. That daemonset
-overrides kernel file-watcher limits, points registry hostname resolution at
-internal IPs, configures kubelet with private-registry credentials, and installs
-a private CA. Usually harmless, since file watchers only matter for dev
-containers. But if you enable `configurePrivateRegistriesInNodes` or
-`wildcardCertificate.privateCA`, the build and okteto nodes will not receive it.
+The cause is that Helm only propagates values under its reserved `global` key
+into subcharts, and Okteto's key is `globals`, so subcharts never see it.
 
-**9. Installer jobs run on the okteto pool, not the dev pool.**
-`okteto deploy` runs as an `installer-*` job in the `okteto` namespace, so the
-dev-namespace mutating webhook never sees it and it inherits the okteto pool.
-Your users' deploy commands therefore execute alongside the control plane. It is
-bounded (small resource requests, `installer.activeDeadlineSeconds`), but it is
-the one place user-authored code runs outside the dev pool.
+`config.yaml` works around this by pinning all three by hand. Keep those blocks
+if you adapt this configuration. This has been reported to Okteto.
 
 ## Teardown
 
 ```bash
-gcloud container clusters delete "$CLUSTER" --zone "$ZONE" --project "$PROJECT"
-gcloud dns record-sets delete "*.${SUBDOMAIN}." --type A --zone "$DNS_ZONE" --project "$PROJECT"
-gcloud dns record-sets delete "${SUBDOMAIN}." --type A --zone "$DNS_ZONE" --project "$PROJECT"
-gcloud iam service-accounts delete "cert-manager-dns01@${PROJECT}.iam.gserviceaccount.com" --project "$PROJECT"
+PROJECT=$PROJECT SUBDOMAIN=$SUBDOMAIN DNS_ZONE=$DNS_ZONE ./scripts/99-teardown.sh
 ```
+
+Deletes the cluster, both DNS records and the cert-manager service account. It
+prompts for confirmation; set `FORCE=1` to skip that.
 
 ## References
 
