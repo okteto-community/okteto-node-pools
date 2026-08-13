@@ -98,38 +98,13 @@ buildkit:
       effect: NoSchedule
 
 # -----------------------------------------------------------------------------
-# Subcharts do NOT inherit `globals`. Without these blocks they render with no
-# nodeSelector at all, and only stay off the tainted pools by luck.
+# `globals` does not reach subcharts, so the two nginx controllers and reloader
+# are not pinned to a pool and run on the default pool. See the README.
 # -----------------------------------------------------------------------------
 ingress-nginx:
   controller:
     replicaCount: 1
-    nodeSelector:
-      okteto-node-pool: okteto
-    tolerations:
-      - key: okteto-node-pool
-        operator: Equal
-        value: okteto
-        effect: NoSchedule
 
 okteto-nginx:
   controller:
     replicaCount: 1
-    nodeSelector:
-      okteto-node-pool: okteto
-    tolerations:
-      - key: okteto-node-pool
-        operator: Equal
-        value: okteto
-        effect: NoSchedule
-
-reloader:
-  reloader:
-    deployment:
-      nodeSelector:
-        okteto-node-pool: okteto
-      tolerations:
-        - key: okteto-node-pool
-          operator: Equal
-          value: okteto
-          effect: NoSchedule

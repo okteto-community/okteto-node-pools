@@ -159,9 +159,12 @@ kubectl get pods -n okteto -o wide
 kubectl get nodes -L okteto-node-pool
 ```
 
-Every pod in the `okteto` namespace should sit on an `okteto` node, except the
-two daemonsets (`okteto-daemon`, `okteto-prepullimages`) which belong on `dev`,
-and `okteto-buildkit` which belongs on `build`.
+Every pod in the `okteto` namespace should sit on an `okteto` node, except:
+
+- the two daemonsets (`okteto-daemon`, `okteto-prepullimages`), which belong on `dev`
+- `okteto-buildkit`, which belongs on `build`
+- the two nginx controllers and `okteto-reloader`, which are unpinned and run on
+  the default pool (see [known limitation](#known-limitation-the-nginx-and-reloader-subcharts))
 
 To check a single pod's intended pool:
 
@@ -208,25 +211,14 @@ okteto namespace delete pooltest
 
 ## Known limitation: the nginx and reloader subcharts
 
-`globals.nodeSelectors` and `globals.tolerations` pin the Okteto chart's own
-workloads, but they are **not** applied to three components that come from
-subcharts:
+`globals.nodeSelectors` and `globals.tolerations` are not currently applied to
+three components that come from subcharts:
 
 - `okteto-ingress-nginx-controller`
 - `okteto-okteto-nginx-controller`
 - `okteto-reloader`
 
-Render the chart with only `globals` set and those three come out with no
-`nodeSelector` and no `tolerations` at all. On a cluster where every Okteto pool
-is tainted, they cannot schedule onto any of them: they land on whatever
-untainted pool exists, or stay `Pending` if none does. Losing both ingress
-controllers takes the instance down.
-
-The cause is that Helm only propagates values under its reserved `global` key
-into subcharts, and Okteto's key is `globals`, so subcharts never see it.
-
-`config.yaml` works around this by pinning all three by hand. Keep those blocks
-if you adapt this configuration. This has been reported to Okteto.
+These three are placed on the default node pool.
 
 ## Teardown
 
