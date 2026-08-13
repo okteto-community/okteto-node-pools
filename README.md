@@ -3,18 +3,32 @@
 Reference configuration for running Okteto Self-Hosted with its workloads split
 across three dedicated node pools, plus a real Let's Encrypt wildcard certificate.
 
-| pool | runs | tainted |
-|---|---|---|
-| `okteto` | control plane: api, frontend, webhook, registry, both nginx controllers, all jobs and cronjobs | no |
-| `dev` | user workloads: dev environments, deployed namespaces, `okteto up` containers, the Okteto daemonset | yes |
-| `build` | BuildKit | yes |
+| pool | runs | labeled | tainted |
+|---|---|---|---|
+| `default` | GKE system workloads (kube-dns, metrics-server) and add-ons such as cert-manager | no | no |
+| `okteto` | control plane: api, frontend, webhook, registry, both nginx controllers, all jobs and cronjobs | yes | yes |
+| `dev` | user workloads: dev environments, deployed namespaces, `okteto up` containers, the Okteto daemonset | yes | yes |
+| `build` | BuildKit | yes | yes |
+
+Keeping the cluster's default pool separate is what lets all three Okteto pools
+be tainted. Something has to stay schedulable for `kube-dns` and friends, so the
+alternative is leaving one Okteto pool untainted and sharing it with system
+workloads.
 
 Why bother: BuildKit is resource hungry and will happily starve the control
 plane, and user workloads are untrusted and unpredictable. Separating the three
 means a runaway build or a broken dev environment cannot take down the Okteto API.
 
-Everything here was validated end to end on a real GKE cluster: chart 1.47.0,
-Kubernetes 1.35, cert-manager v1.21.1.
+Validated on a real GKE cluster: chart 1.47.0, Kubernetes 1.35, cert-manager
+v1.21.1, including a real app deploy landing entirely on the dev pool and a
+trusted Let's Encrypt wildcard certificate.
+
+That cluster ran with the `okteto` pool untainted and no separate default pool.
+The Helm values in this repo are byte-for-byte the ones it ran. Splitting out a
+default pool and tainting `okteto` changes only the node topology, and it makes
+the `globals.tolerations.okteto` entry load-bearing rather than a no-op. All 23
+chart workloads render with both a pool selector and its matching toleration, so
+each can schedule onto its tainted pool.
 
 ## Contents
 
@@ -46,22 +60,25 @@ export DNS_ZONE=my-cloud-dns-zone
 ./scripts/01-create-cluster.sh
 ```
 
-This creates a zonal cluster whose **default pool is the `okteto` pool**, then
-adds `dev` and `build` as tainted pools. All three use `n2-standard-4` with
-250 GB disks, the sizing the Okteto GKE install guide recommends.
+This creates a zonal cluster with a small untainted default pool for system
+workloads, then adds `okteto`, `dev` and `build` as labeled, tainted pools. The
+three Okteto pools use `n2-standard-4` with 250 GB disks, the sizing the Okteto
+GKE install guide recommends. The default pool only carries add-ons, so it is
+smaller (`e2-standard-2`).
 
 The node labels and taints are the contract the Helm values depend on:
 
 | pool | label | taint |
 |---|---|---|
-| `okteto` | `okteto-node-pool=okteto` | none |
+| `default` | none | none |
+| `okteto` | `okteto-node-pool=okteto` | `okteto-node-pool=okteto:NoSchedule` |
 | `dev` | `okteto-node-pool=dev` | `okteto-node-pool=dev:NoSchedule` |
 | `build` | `okteto-node-pool=build` | `okteto-node-pool=build:NoSchedule` |
 
-> **Do not taint all three pools.** The `okteto` pool is the cluster's default
-> pool. If every pool is tainted, GKE's own system workloads (`kube-dns`,
-> `metrics-server`) have nowhere to schedule and the cluster is broken before
-> Okteto is even installed.
+> **Leave the default pool untainted.** Taint every pool in the cluster and
+> GKE's own system workloads (`kube-dns`, `metrics-server`) have nowhere to
+> schedule, breaking the cluster before Okteto is even installed. Anything
+> without an `okteto-node-pool` selector, including cert-manager, lands here.
 
 ### 2. Install Okteto
 
@@ -160,10 +177,10 @@ kubectl -n pooltest get pod -o jsonpath='{.items[0].spec.nodeSelector}'
 kubectl delete namespace pooltest
 ```
 
-**Prove the pinning is airtight with an empty fourth pool.** Add a pool with
-zero nodes, labeled but **untainted**, and confirm it stays empty. A tainted
-empty pool proves nothing; an untainted one attracts anything not properly
-pinned:
+**Prove the pinning is airtight with an empty spare pool.** Add a pool with zero
+nodes, labeled but **untainted**, and confirm it stays empty. A tainted empty
+pool proves nothing, since the taint alone would keep pods away; an untainted one
+is a real test, because anything not properly pinned is free to land there:
 
 ```bash
 gcloud container node-pools create spare \
@@ -181,7 +198,8 @@ Expected steady state on a default install:
 |---|---|
 | `dev` | `okteto-daemon`, `okteto-prepullimages`, plus every user pod |
 | `build` | `okteto-buildkit` |
-| `okteto` | everything else, including `okteto-registry` and all jobs/cronjobs |
+| `okteto` | everything else in the `okteto` namespace, including `okteto-registry` and all jobs/cronjobs |
+| `default` | GKE system workloads and cert-manager, none of which carry an `okteto-node-pool` selector |
 
 ## Gotchas
 
@@ -273,8 +291,10 @@ in `globals.tolerations`". There is no such key. `globals.tolerations` takes
 
 **4. Subcharts ignore `globals` entirely.**
 `ingress-nginx`, `okteto-nginx` and `reloader` are upstream subcharts. Render the
-chart without pinning them and they come out with no `nodeSelector` at all. They
-only stay off the tainted pools by luck. Pin all three by hand.
+chart without pinning them and they come out with no `nodeSelector` at all. With
+all three Okteto pools tainted, they would then land on the small default pool
+alongside `kube-dns` instead of on the okteto pool, which is both wrong and a
+good way to exhaust that pool. Pin all three by hand.
 
 **5. `regcredsManager` uses `replicas`, not `replicaCount`.**
 Set `replicaCount` everywhere else and this one silently stays at 2.
