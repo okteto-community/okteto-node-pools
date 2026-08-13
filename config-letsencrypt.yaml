@@ -1,0 +1,29 @@
+# Values overlay switching Okteto from its self-signed wildcard certificate to
+# one issued by cert-manager / Let's Encrypt. Layer it on top of config.yaml:
+#
+#   helm upgrade okteto okteto/okteto -f config.yaml -f config-letsencrypt.yaml ...
+#
+# Apply only AFTER the Certificate has been issued, otherwise nginx points at a
+# secret that does not exist yet.
+
+# Stop the chart generating its self-signed wildcard certificate. This flips
+# every internal reference (OKTETO_INGRESS_TLS_SECRET_NAME, the ingress tls
+# block, the buildkit and registry certificates) from
+# `default-ssl-certificate-selfsigned` to `default-ssl-certificate`, which is
+# the secret cert-manager writes.
+wildcardCertificate:
+  create: false
+
+# GOTCHA: one reference does NOT follow that switch. The ingress-nginx subchart
+# receives --default-ssl-certificate as a hardcoded argument still pointing at
+# ...-selfsigned, so `create: false` on its own leaves the ingress serving the
+# old self-signed certificate while everything else uses the real one. That
+# failure is silent: the Certificate reports Ready, but browsers still warn.
+#
+# Confirm with:
+#   helm template okteto okteto/okteto -f config.yaml -f config-letsencrypt.yaml \
+#     | grep -c default-ssl-certificate-selfsigned      # must be 0
+ingress-nginx:
+  controller:
+    extraArgs:
+      default-ssl-certificate: $(POD_NAMESPACE)/default-ssl-certificate

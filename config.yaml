@@ -1,0 +1,135 @@
+# Okteto Helm values: three dedicated node pools.
+# Tested against Okteto chart 1.47.0.
+#
+# The subdomain placeholder below is substituted by scripts/02-install-okteto.sh
+# with your Okteto domain (e.g. okteto.example.com).
+# The license is injected at install time, never stored in this file.
+
+subdomain: "SUBDOMAIN"
+
+# Filesystem-backed registry storage. Fine for a test cluster.
+# For production use object storage (GCS / S3 / Azure Blob) instead.
+registry:
+  storage:
+    filesystem:
+      persistence:
+        enabled: true
+
+# -----------------------------------------------------------------------------
+# Three-pool scheduling
+# -----------------------------------------------------------------------------
+#   globals.nodeSelectors.okteto + globals.tolerations.okteto
+#     -> control-plane pods in the okteto namespace (excluding the daemonset)
+#   globals.nodeSelectors.dev + globals.tolerations.dev
+#     -> pods in Okteto-managed namespaces, plus the Okteto daemonset
+#   buildkit.nodeSelectors + buildkit.tolerations   (below)
+#     -> BuildKit
+#
+# Set BOTH halves for any tainted pool. A selector on its own places pods on a
+# node they cannot tolerate, and they stay Pending forever.
+#
+# NOTE: the terse `tolerations.{oktetoPool,buildPool,devPool}` short form does
+# the same job in three lines, but it is DEPRECATED and removed in Okteto
+# Chart 2.0. Installing with it prints a deprecation warning.
+globals:
+  nodeSelectors:
+    okteto:
+      okteto-node-pool: okteto
+    dev:
+      okteto-node-pool: dev
+  tolerations:
+    okteto:
+      - key: okteto-node-pool
+        operator: Equal
+        value: okteto
+        effect: NoSchedule
+    dev:
+      - key: okteto-node-pool
+        operator: Equal
+        value: dev
+        effect: NoSchedule
+
+# Soft preference: keep dev workloads off nodes flagged as overloaded.
+affinity:
+  devPool:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 50
+        preference:
+          matchExpressions:
+            - key: dev.okteto.com/overloaded
+              operator: DoesNotExist
+
+# -----------------------------------------------------------------------------
+# Test-cluster sizing: one instance of each service (chart defaults are 2).
+# Drop this whole block for production.
+# -----------------------------------------------------------------------------
+api:
+  replicaCount: 1
+webhook:
+  replicaCount: 1
+frontend:
+  replicaCount: 1
+defaultBackend:
+  replicaCount: 1
+sshAgent:
+  replicaCount: 1
+kubeAPIServerProxy:
+  replicaCount: 1
+# Note: this component uses `replicas`, not `replicaCount`.
+regcredsManager:
+  replicas: 1
+
+buildkit:
+  replicaCount: 1
+  hpa:
+    adapter:
+      replicaCount: 1
+  persistence:
+    enabled: true
+    size: 100Gi
+    # For real workloads point this at an SSD storage class and raise the size.
+    # class: okteto-ssd
+  nodeSelectors:
+    okteto-node-pool: build
+  tolerations:
+    - key: okteto-node-pool
+      operator: Equal
+      value: build
+      effect: NoSchedule
+
+# -----------------------------------------------------------------------------
+# Subcharts do NOT inherit `globals`. Without these blocks they render with no
+# nodeSelector at all, and only stay off the tainted pools by luck.
+# -----------------------------------------------------------------------------
+ingress-nginx:
+  controller:
+    replicaCount: 1
+    nodeSelector:
+      okteto-node-pool: okteto
+    tolerations:
+      - key: okteto-node-pool
+        operator: Equal
+        value: okteto
+        effect: NoSchedule
+
+okteto-nginx:
+  controller:
+    replicaCount: 1
+    nodeSelector:
+      okteto-node-pool: okteto
+    tolerations:
+      - key: okteto-node-pool
+        operator: Equal
+        value: okteto
+        effect: NoSchedule
+
+reloader:
+  reloader:
+    deployment:
+      nodeSelector:
+        okteto-node-pool: okteto
+      tolerations:
+        - key: okteto-node-pool
+          operator: Equal
+          value: okteto
+          effect: NoSchedule

@@ -1,0 +1,12 @@
+# Never commit licenses or credentials
+*.license
+*.key
+*.pem
+*-key.json
+service-account*.json
+
+# Rendered values with a subdomain or license substituted in
+config.rendered.yaml
+*.rendered.yaml
+
+.DS_Store

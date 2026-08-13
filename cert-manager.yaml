@@ -1,0 +1,47 @@
+# Let's Encrypt wildcard certificate for an Okteto instance on GKE.
+#
+# Okteto needs a WILDCARD certificate (every dev-environment endpoint is a
+# subdomain), and Let's Encrypt only issues wildcards over DNS-01. cert-manager
+# therefore needs write access to your Cloud DNS zone: see
+# scripts/03-setup-dns-iam.sh.
+#
+# Replace GCP_PROJECT, EMAIL and SUBDOMAIN before applying:
+#   kubectl apply -f cert-manager.yaml
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-dns01
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: EMAIL
+    privateKeySecretRef:
+      name: letsencrypt-dns01-account-key
+    solvers:
+      - dns01:
+          cloudDNS:
+            project: GCP_PROJECT
+            # No serviceAccountSecretRef: cert-manager authenticates through
+            # Workload Identity, via the annotation on its ServiceAccount.
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  # Once wildcardCertificate.create=false, the chart wires everything to a
+  # secret named exactly `default-ssl-certificate`.
+  name: default-ssl-certificate
+  namespace: okteto
+spec:
+  secretName: default-ssl-certificate
+  issuerRef:
+    name: letsencrypt-dns01
+    kind: ClusterIssuer
+  commonName: "*.SUBDOMAIN"
+  dnsNames:
+    - "SUBDOMAIN"
+    - "*.SUBDOMAIN"
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    rotationPolicy: Always
