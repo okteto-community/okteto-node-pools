@@ -45,14 +45,12 @@ for p in sorted(pods, key=lambda x: x['metadata']['name']):
     actual = nodes.get(node, '(unscheduled)')
 
     if sel == '(none)':
-        # The nginx controllers and reloader come from subcharts, which do not
-        # receive globals.nodeSelectors / globals.tolerations. They are expected
-        # to be unpinned and to run on the default pool.
-        if any(k in name for k in ('nginx-controller', 'reloader')):
-            status = 'unpinned (expected, subchart)'
-        else:
-            status = 'UNPINNED'
-            problems.append((name, 'no okteto-node-pool selector'))
+        status = 'UNPINNED'
+        # The nginx controllers and reloader come from subcharts and need their
+        # own scheduling blocks. Unpinned here usually means those are missing.
+        hint = (' (subchart: set ingress-nginx / okteto-nginx / reloader keys)'
+                if any(k in name for k in ('nginx-controller', 'reloader')) else '')
+        problems.append((name, 'no okteto-node-pool selector' + hint))
     elif sel != actual:
         status = 'MISMATCH'
         problems.append((name, f'selector={sel} but running on {actual}'))

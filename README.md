@@ -159,12 +159,12 @@ kubectl get pods -n okteto -o wide
 kubectl get nodes -L okteto-node-pool
 ```
 
-Every pod in the `okteto` namespace should sit on an `okteto` node, except:
+Every pod in the `okteto` namespace should sit on an `okteto` node, except the
+two daemonsets (`okteto-daemon`, `okteto-prepullimages`) which belong on `dev`,
+and `okteto-buildkit` which belongs on `build`.
 
-- the two daemonsets (`okteto-daemon`, `okteto-prepullimages`), which belong on `dev`
-- `okteto-buildkit`, which belongs on `build`
-- the two nginx controllers and `okteto-reloader`, which are unpinned and run on
-  the default pool (see [known limitation](#known-limitation-the-nginx-and-reloader-subcharts))
+If the nginx controllers or `okteto-reloader` show up unpinned, the
+[subchart blocks](#subcharts-need-their-own-scheduling-blocks) are missing.
 
 To check a single pod's intended pool:
 
@@ -209,16 +209,29 @@ Clean up:
 okteto namespace delete pooltest
 ```
 
-## Known limitation: the nginx and reloader subcharts
+## Subcharts need their own scheduling blocks
 
-`globals.nodeSelectors` and `globals.tolerations` are not currently applied to
-three components that come from subcharts:
+`globals.nodeSelectors` and `globals.tolerations` cover the Okteto chart's own
+workloads. Three components come from subcharts and take their own keys instead:
 
-- `okteto-ingress-nginx-controller`
-- `okteto-okteto-nginx-controller`
-- `okteto-reloader`
+| component | key |
+|---|---|
+| `okteto-ingress-nginx-controller` | `ingress-nginx.controller.{nodeSelector,tolerations}` |
+| `okteto-okteto-nginx-controller` | `okteto-nginx.controller.{nodeSelector,tolerations}` |
+| `okteto-reloader` | `reloader.reloader.deployment.{nodeSelector,tolerations}` |
 
-These three are placed on the default node pool.
+This is the normal Helm convention rather than an Okteto quirk: a chart's
+`global` is for cross-cutting infrastructure such as image registry and pull
+secrets, not scheduling, since components often want different placement. Both
+subcharts read `.Values.global` for images and nothing else.
+
+`config.yaml` sets all three, and they are in the same file as everything else,
+so it is still one `helm upgrade`. Keep those blocks if you adapt this
+configuration. Leave them out and the three schedule wherever they fit, which on
+this layout means the small default pool alongside `kube-dns`.
+
+Both subcharts also accept `affinity`, `topologySpreadConstraints` and
+`priorityClassName` under the same keys if you need finer placement.
 
 ## Teardown
 

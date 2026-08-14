@@ -98,13 +98,45 @@ buildkit:
       effect: NoSchedule
 
 # -----------------------------------------------------------------------------
-# `globals` does not reach subcharts, so the two nginx controllers and reloader
-# are not pinned to a pool and run on the default pool. See the README.
+# Subcharts take their own scheduling keys
 # -----------------------------------------------------------------------------
+# `globals` covers the Okteto chart's own workloads. The two nginx controllers
+# and reloader come from subcharts, which follow the usual Helm convention: a
+# chart's `global` is for cross-cutting infrastructure (image registry, pull
+# secrets), not scheduling, so each exposes its own keys instead.
+#
+# Set them here, in the same file. Omit them and these three end up wherever the
+# scheduler can fit them, which on this layout is the small default pool next to
+# kube-dns.
 ingress-nginx:
   controller:
     replicaCount: 1
+    nodeSelector:
+      okteto-node-pool: okteto
+    tolerations:
+      - key: okteto-node-pool
+        operator: Equal
+        value: okteto
+        effect: NoSchedule
 
 okteto-nginx:
   controller:
     replicaCount: 1
+    nodeSelector:
+      okteto-node-pool: okteto
+    tolerations:
+      - key: okteto-node-pool
+        operator: Equal
+        value: okteto
+        effect: NoSchedule
+
+reloader:
+  reloader:
+    deployment:
+      nodeSelector:
+        okteto-node-pool: okteto
+      tolerations:
+        - key: okteto-node-pool
+          operator: Equal
+          value: okteto
+          effect: NoSchedule
