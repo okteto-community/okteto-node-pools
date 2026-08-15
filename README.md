@@ -242,6 +242,11 @@ PROJECT=$PROJECT SUBDOMAIN=$SUBDOMAIN DNS_ZONE=$DNS_ZONE ./scripts/99-teardown.s
 Deletes the cluster, both DNS records and the cert-manager service account. It
 prompts for confirmation; set `FORCE=1` to skip that.
 
+It also deletes the persistent disks backing the BuildKit and registry PVCs.
+Deleting a GKE cluster does **not** remove those, so they are recorded before
+the cluster goes away and cleaned up afterwards. On our test cluster that was
+140 GB that would otherwise have kept billing.
+
 ## References
 
 - [Okteto Helm configuration](https://www.okteto.com/docs/self-hosted/helm-configuration/)
